@@ -5,5 +5,5 @@
     "css": "photon-gpu.css",
     "service_worker": "sw-photon.js",
     "author": "PhotonOptimizer",
-    "version": "4.0.2"
+    "version": "4.0.3"
 }
