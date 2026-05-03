@@ -1,0 +1,20 @@
+/* 强制聊天容器 GPU 合成层，关闭所有隐式动画 */
+#chat, #chat .mes, #sheld .drawer {
+    backface-visibility: hidden;
+    transform: translate3d(0,0,0);
+    will-change: scroll-position, transform;
+    animation: none !important;
+    transition: none !important;
+}
+/* 虚拟消息绝对定位，彻底避免布局抖动 */
+.virtual-mes {
+    position: absolute;
+    left: 0;
+    right: 0;
+    contain: layout style paint;
+    content-visibility: auto;
+    contain-intrinsic-size: 0 80px;
+}
+.virtual-mes[aria-hidden="true"] { display: none; }
+/* 所有动画禁用 */
+* { animation-duration: 0s !important; transition-duration: 0s !important; }

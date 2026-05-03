@@ -1,0 +1,9 @@
+{
+    "display_name": "Photon Client Hyperdrive",
+    "loading_order": 1,
+    "js": "nitro-photon.js",
+    "css": "photon-gpu.css",
+    "service_worker": "sw-photon.js",
+    "author": "PhotonOptimizer",
+    "version": "4.0.0"
+}
