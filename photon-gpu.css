@@ -1,7 +1,19 @@
-/* 仅作用于虚拟滚动消息节点，避免影响其他 UI */
-#photon-viewport .virtual-mes {
+/* 严格限制：仅对聊天容器内的消息元素应用硬件加速 */
+#chat .mes {
     backface-visibility: hidden;
-    transform: translateZ(0);
+    transform: translate3d(0,0,0);
+    will-change: transform;
+    contain: layout style;
+}
+
+/* 虚拟消息绝对定位，避免布局抖动 */
+.virtual-mes {
+    position: absolute;
+    left: 0;
+    right: 0;
     contain: layout style paint;
 }
-/* 保留原始 .mes 样式不变 */
+.virtual-mes[aria-hidden="true"] { display: none; }
+
+/* 移除全局动画禁用 */
+/* * { animation: none !important; transition: none !important; } */
