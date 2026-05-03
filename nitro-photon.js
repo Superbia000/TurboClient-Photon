@@ -1,5 +1,5 @@
 /**
- * TurboClient-Photon v4.0.3: 终极客户端加速引擎 (健壮启动版)
+ * TurboClient-Photon v4.0.4: 终极客户端加速引擎 (修正 WeakMap 错误)
  * 
  * 功能:
  *   1. Service Worker 离线缓存 + 预取
@@ -10,23 +10,20 @@
  *   6. 事件监听自动回收 (防止内存泄漏)
  *   7. 预测预取 (hover 角色时预加载)
  *   8. 图片预加载 (link rel=preload)
- *   9. 防抖 / 节流工具
- *  10. 全局错误捕获 + 右下角状态栏
+ *   9. 全局错误捕获 + 右下角状态栏
  * 
- * 启动策略:
- *  - 优先监听 APP_READY 事件
- *  - 5 秒后若未触发，自动强制启动所有引擎
+ * 修正: 事件回收模块增加 this 类型检查，避免 WeakMap 键无效导致崩溃
  */
 
 const PHOTON = {
-    viewport: null,            // 虚拟滚动容器
-    vNodes: new Map(),         // 消息ID -> DOM节点
-    messageHeights: new Map(), // 消息ID -> 实际高度(px)
+    viewport: null,
+    vNodes: new Map(),
+    messageHeights: new Map(),
     frameScheduled: false,
-    worker: null,              // 流式 Worker
-    lastMsgNode: null,         // 最新消息节点 (永远保留在 DOM)
+    worker: null,
+    lastMsgNode: null,
     statusEl: null,
-    db: null,                  // IndexedDB 实例
+    db: null,
     resizeObserver: null,
 };
 
@@ -343,19 +340,24 @@ function initVirtualScroll() {
     setStatus('虚拟滚动引擎 (动态高度) 已启动', 'success');
 }
 
-/* ───────── 事件自动回收 ───────── */
+/* ───────── 事件自动回收 (修正 WeakMap 错误) ───────── */
 function initEventCleaner() {
     const reg = new WeakMap();
     const origAdd = EventTarget.prototype.addEventListener;
     EventTarget.prototype.addEventListener = function(type, fn, opts) {
-        if (!reg.has(this)) reg.set(this, []);
-        reg.get(this).push({ type, fn, opts });
+        // 修复：仅当 this 是合法对象时才记录，否则直接调用原方法
+        if (this && typeof this === 'object') {
+            if (!reg.has(this)) reg.set(this, []);
+            reg.get(this).push({ type, fn, opts });
+        }
         return origAdd.call(this, type, fn, opts);
     };
     new MutationObserver(muts => {
         muts.forEach(m => m.removedNodes.forEach(node => {
             if (node instanceof Element && reg.has(node)) {
-                reg.get(node).forEach(l => node.removeEventListener(l.type, l.fn, l.opts));
+                reg.get(node).forEach(l => {
+                    try { node.removeEventListener(l.type, l.fn, l.opts); } catch(e) {}
+                });
                 reg.delete(node);
             }
         }));
@@ -416,7 +418,6 @@ async function main() {
     const ctx = SillyTavern.getContext();
     let ready = false;
     ctx.eventSource.on('APP_READY', () => { if (!ready) { ready = true; startAllEngines(); } });
-    // 5 秒超时兜底
     setTimeout(() => { if (!ready) { ready = true; startAllEngines(); } }, 5000);
 }
 
