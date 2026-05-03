@@ -13,10 +13,10 @@
  *   9. 全局错误捕获 + 右下角状态栏
  * 
  * 修正:
- *   - CSS 仅作用于虚拟滚动消息节点，保留原始 .mes 样式
- *   - 虚拟滚动仅在检测到聊天界面时激活，否则完全跳过
- *   - 事件回收排除全局高频事件，避免干扰其他扩展
- *   - 页面切换时自动销毁/重建虚拟滚动
+ *   - 彻底移除全局事件劫持 (删除 initEventCleaner)
+ *   - CSS 严格限制在 #chat .mes 元素
+ *   - 虚拟滚动仅转换聊天消息，主动跳过插件UI元素
+ *   - 禁用Service Worker以避免潜在缓存冲突
  */
 
 const PHOTON = {
@@ -29,7 +29,7 @@ const PHOTON = {
     statusEl: null,
     db: null,
     resizeObserver: null,
-    active: false,        // 是否处于聊天界面
+    active: false,
     _origAddMessage: null,
 };
 
@@ -49,14 +49,6 @@ function setStatus(text, type = 'info') {
     PHOTON.statusEl.style.color = colors[type] || '#0f0';
     PHOTON.statusEl.textContent = `⚡ ${text}`;
     console.log(`%c[Photon-Client] ${text}`, `color:${colors[type]}`);
-}
-
-/* ───────── Service Worker ───────── */
-function registerServiceWorker() {
-    if (!('serviceWorker' in navigator)) return;
-    navigator.serviceWorker.register('/scripts/extensions/third-party/TurboClient-Photon/sw-photon.js')
-        .then(() => setStatus('Service Worker 已注册', 'success'))
-        .catch(e => setStatus(`SW 注册失败: ${e.message}`, 'error'));
 }
 
 /* ───────── IndexedDB ───────── */
@@ -149,7 +141,7 @@ function initStreamWorker() {
     }
 }
 
-/* ───────── 虚拟滚动 (仅在聊天界面激活) ───────── */
+/* ───────── 虚拟滚动 (严格隔离版) ───────── */
 function isChatVisible() {
     const chatEl = document.getElementById('chat');
     return chatEl && window.getComputedStyle(chatEl).display !== 'none';
@@ -166,7 +158,16 @@ function initVirtualScroll() {
     const viewport = document.createElement('div');
     viewport.id = 'photon-viewport';
     viewport.style.cssText = 'position:relative;height:100%;overflow-y:scroll;overflow-x:hidden;contain:strict;';
-    while (chatEl.firstChild) viewport.appendChild(chatEl.firstChild);
+    
+    // 关键修改：只移动看起来像消息的元素，避免移动其他插件的UI元素
+    const childNodes = Array.from(chatEl.childNodes);
+    childNodes.forEach(node => {
+        if (node.nodeType === Node.ELEMENT_NODE && (node.classList.contains('mes') || node.querySelector('.mes_text'))) {
+            viewport.appendChild(node);
+        } else if (node.nodeType === Node.ELEMENT_NODE) {
+            // 对于不是消息的元素（如插件UI），保留在chat容器中，避免被移除
+        }
+    });
     chatEl.appendChild(viewport);
     PHOTON.viewport = viewport;
     const ctx = SillyTavern.getContext();
@@ -174,7 +175,7 @@ function initVirtualScroll() {
 
     function createVNode(msg, idx) {
         const div = document.createElement('div');
-        div.className = 'virtual-mes';  // 不再使用 mes 类，避免与原始样式冲突
+        div.className = 'virtual-mes';
         div.innerHTML = `<div class="mes_text">${msg.mes || ''}</div>`;
         div.style.cssText = 'position:absolute;left:0;right:0;padding:8px;box-sizing:border-box;';
         div.dataset.msgIndex = idx;
@@ -243,7 +244,6 @@ function initVirtualScroll() {
 
     viewport.addEventListener('scroll', scheduleUpdate, { passive: true });
 
-    // 劫持 addOneMessage
     if (!PHOTON._origAddMessage) PHOTON._origAddMessage = window.addOneMessage;
     window.addOneMessage = function(msg) {
         const el = PHOTON._origAddMessage.call(this, msg);
@@ -257,7 +257,7 @@ function initVirtualScroll() {
     ctx.eventSource.on('message_deleted', scheduleUpdate);
     ctx.eventSource.on('chat_changed', scheduleUpdate);
     updateVisible();
-    setStatus('虚拟滚动引擎已启动','success');
+    setStatus('虚拟滚动引擎已启动 (隔离模式)','success');
 }
 
 function destroyVirtualScroll() {
@@ -275,45 +275,6 @@ function destroyVirtualScroll() {
     if (PHOTON._origAddMessage) { window.addOneMessage = PHOTON._origAddMessage; }
 }
 
-/* ───────── 事件自动回收 (排除高频事件) ───────── */
-function initEventCleaner() {
-    const reg = new WeakMap();
-    const origAdd = EventTarget.prototype.addEventListener;
-    EventTarget.prototype.addEventListener = function(type, fn, opts) {
-        if (this && typeof this === 'object') {
-            // 不记录高频或全局事件，避免清理过度
-            if (!['click','mousemove','scroll','resize','keydown','keyup'].includes(type)) {
-                if (!reg.has(this)) reg.set(this, []);
-                reg.get(this).push({ type, fn, opts });
-            }
-        }
-        return origAdd.call(this, type, fn, opts);
-    };
-    new MutationObserver(muts => {
-        muts.forEach(m => m.removedNodes.forEach(node => {
-            if (node instanceof Element && reg.has(node)) {
-                reg.get(node).forEach(l => { try { node.removeEventListener(l.type, l.fn, l.opts); } catch(e){} });
-                reg.delete(node);
-            }
-        }));
-    }).observe(document.body, { childList: true, subtree: true });
-    setStatus('事件自动回收已激活','success');
-}
-
-/* ───────── 预取 ───────── */
-function initPrefetch() {
-    document.addEventListener('mouseover', ((fn, limit) => {
-        let ready = true;
-        return (e) => {
-            if (ready && e.target.closest('[data-character-id]') && navigator.serviceWorker.controller) {
-                navigator.serviceWorker.controller.postMessage('PREFETCH_CHARACTERS');
-                ready = false; setTimeout(() => ready = true, limit);
-            }
-        };
-    })(undefined, 200));
-    setStatus('预取就绪','success');
-}
-
 /* ───────── 界面切换监听 ───────── */
 function watchUIChange() {
     const ctx = SillyTavern.getContext();
@@ -328,7 +289,6 @@ function watchUIChange() {
             }
         }, 100);
     });
-    // 初始检测
     if (isChatVisible()) {
         initVirtualScroll();
         initStreamWorker();
@@ -341,7 +301,6 @@ window.addEventListener('unhandledrejection', e => setStatus(`未捕获Promise: 
 
 /* ───────── 主启动 ───────── */
 async function main() {
-    registerServiceWorker();
     loadMsgPack();
     setStatus('Photon 引擎启动中...','info');
     try { PHOTON.db = await openDB(); setStatus('IndexedDB 就绪','success'); } catch(e) { setStatus('IndexedDB 不可用','warn'); }
@@ -355,9 +314,7 @@ async function main() {
     function startEngines() {
         if (window.__photonStarted) return;
         window.__photonStarted = true;
-        initEventCleaner();
-        initPrefetch();
-        watchUIChange(); // 根据界面自动启用/停用虚拟滚动
+        watchUIChange();
         setStatus('加速引擎已就绪 ⚡','success');
         if ('requestIdleCallback' in window) {
             requestIdleCallback(() => { fetch('/api/characters/all').then(r=>r.json()).then(d=>cacheInDB('/api/characters/all',d)); }, { timeout: 2000 });
