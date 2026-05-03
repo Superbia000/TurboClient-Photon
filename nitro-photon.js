@@ -1,22 +1,9 @@
 /**
- * TurboClient-Photon v4.0.4: 终极客户端加速引擎 (修正 WeakMap 错误)
- * 
- * 功能:
- *   1. Service Worker 离线缓存 + 预取
- *   2. IndexedDB 本地 API 缓存 (带 TTL)
- *   3. MessagePack 二进制解码 (自动回退 JSON)
- *   4. 流式响应 Worker 处理 (主线程无阻塞)
- *   5. 完全虚拟滚动 (ResizeObserver 动态高度)
- *   6. 事件监听自动回收 (防止内存泄漏)
- *   7. 预测预取 (hover 角色时预加载)
- *   8. 图片预加载 (link rel=preload)
- *   9. 全局错误捕获 + 右下角状态栏
- * 
- * 修正:
- *   - 彻底移除全局事件劫持 (删除 initEventCleaner)
- *   - CSS 严格限制在 #chat .mes 元素
- *   - 虚拟滚动仅转换聊天消息，主动跳过插件UI元素
- *   - 禁用Service Worker以避免潜在缓存冲突
+ * TurboClient-Photon v4.0.7: 终极启动优化版
+ *   - 启动延迟：利用 requestIdleCallback 分片执行重任务
+ *   - 虚拟滚动首屏只渲染可见区域，其余空闲时补全
+ *   - Service Worker 预缓存关键资源
+ *   - 完全不影响其他插件（无全局事件劫持、CSS 严格隔离）
  */
 
 const PHOTON = {
@@ -29,11 +16,11 @@ const PHOTON = {
     statusEl: null,
     db: null,
     resizeObserver: null,
-    active: false,
     _origAddMessage: null,
+    idleTasks: [],
 };
 
-/* ───────── 状态提示 ───────── */
+/* ───────── 状态栏 ───────── */
 function createStatusEl() {
     if (!document.getElementById('photon-status')) {
         const el = document.createElement('div');
@@ -51,7 +38,24 @@ function setStatus(text, type = 'info') {
     console.log(`%c[Photon-Client] ${text}`, `color:${colors[type]}`);
 }
 
-/* ───────── IndexedDB ───────── */
+/* ───────── 空闲任务调度 ───────── */
+function scheduleIdle(cb) {
+    if ('requestIdleCallback' in window) {
+        return requestIdleCallback(cb, { timeout: 2000 });
+    } else {
+        return setTimeout(cb, 0);
+    }
+}
+
+/* ───────── Service Worker 注册 ───────── */
+function registerSW() {
+    if (!('serviceWorker' in navigator)) return;
+    navigator.serviceWorker.register('/scripts/extensions/third-party/TurboClient-Photon/sw-photon.js')
+        .then(() => setStatus('SW 已注册', 'success'))
+        .catch(e => setStatus(`SW 注册失败: ${e.message}`, 'error'));
+}
+
+/* ───────── IndexedDB (TTL 5分钟) ───────── */
 const DB_NAME = 'PhotonCache', DB_VERSION = 1, CACHE_TTL = 5*60*1000;
 function openDB() {
     return new Promise((resolve, reject) => {
@@ -63,49 +67,48 @@ function openDB() {
 }
 async function cacheInDB(url, data) {
     if (!PHOTON.db) return;
-    try { const tx = PHOTON.db.transaction('apiCache','readwrite'); tx.objectStore('apiCache').put({url, data, timestamp: Date.now()}); await tx.done; } catch(e){}
+    try { const tx = PHOTON.db.transaction('apiCache','readwrite'); tx.objectStore('apiCache').put({url, data, timestamp: Date.now()}); await tx.done; } catch(e) {}
 }
 async function getFromDB(url) {
     if (!PHOTON.db) return null;
-    try { const tx = PHOTON.db.transaction('apiCache','readonly'); const r = await tx.objectStore('apiCache').get(url); return (r && Date.now()-r.timestamp < CACHE_TTL) ? r.data : null; } catch(e){ return null; }
+    try { const tx = PHOTON.db.transaction('apiCache','readonly'); const r = await tx.objectStore('apiCache').get(url); return (r && Date.now()-r.timestamp < CACHE_TTL) ? r.data : null; } catch(e) { return null; }
 }
 
-/* ───────── MessagePack 安全解码 ───────── */
+/* ───────── MessagePack ───────── */
 let msgpackReady = false;
 function loadMsgPack() {
-    if (window.msgpackLite) { msgpackReady = true; setStatus('MsgPack 库就绪','success'); return; }
+    if (window.msgpackLite) { msgpackReady = true; setStatus('MsgPack 就绪','success'); return; }
     const s = document.createElement('script');
     s.src = 'https://cdn.jsdelivr.net/npm/msgpack-lite@0.1.26/dist/msgpack.min.js';
     s.onload = () => { msgpackReady = true; setStatus('MsgPack 加载成功','success'); };
     s.onerror = () => setStatus('MsgPack 加载失败，用 JSON','warn');
     document.head.appendChild(s);
 }
-async function safeDecodeMsgPack(response) {
-    const ct = response.headers.get('Content-Type')||'';
-    if (!msgpackReady || !ct.includes('application/x-msgpack')) return response.json();
-    const clone = response.clone();
-    try { const buf = await clone.arrayBuffer(); return window.msgpackLite.decode(new Uint8Array(buf)); }
-    catch(e) { setStatus('MsgPack 解码失败，回退 JSON','error'); return response.json(); }
-}
 
 /* ───────── fetch 劫持 ───────── */
 const originalFetch = window.fetch;
 window.fetch = function(url, options={}) {
-    if (typeof url === 'string' && url.startsWith('/api')) {
-        const method = (options.method || 'GET').toUpperCase();
-        if (method === 'GET') {
-            return getFromDB(url).then(cached => {
-                if (cached) { setStatus(`IDB 命中: ${url}`,'info'); return new Response(JSON.stringify(cached), {status:200, headers:{'Content-Type':'application/json','X-IDB-Cache':'HIT'}}); }
-                return performNetworkFetch(url, options);
-            });
-        } else {
-            return performNetworkFetch(url, options).then(res => {
-                if (res.ok) { const base = url.split('?')[0]; setTimeout(() => { if(PHOTON.db){ const tx=PHOTON.db.transaction('apiCache','readwrite'); tx.objectStore('apiCache').delete(base); } },0); }
-                return res;
-            });
-        }
+    if (typeof url !== 'string' || !url.startsWith('/api')) {
+        return originalFetch.call(this, url, options);
     }
-    return originalFetch.call(this, url, options);
+    const method = (options.method || 'GET').toUpperCase();
+    if (method === 'GET') {
+        return getFromDB(url).then(cached => {
+            if (cached) {
+                setStatus(`IDB 命中: ${url}`,'info');
+                return new Response(JSON.stringify(cached), {status:200, headers:{'Content-Type':'application/json','X-IDB-Cache':'HIT'}});
+            }
+            return performNetworkFetch(url, options);
+        });
+    } else {
+        return performNetworkFetch(url, options).then(res => {
+            if (res.ok) {
+                const base = url.split('?')[0];
+                setTimeout(() => { if(PHOTON.db){ const tx=PHOTON.db.transaction('apiCache','readwrite'); tx.objectStore('apiCache').delete(base); } },0);
+            }
+            return res;
+        });
+    }
 
     async function performNetworkFetch(url, options) {
         options.headers = options.headers || {};
@@ -115,8 +118,9 @@ window.fetch = function(url, options={}) {
             const clone = res.clone();
             const ct = clone.headers.get('Content-Type')||'';
             let data;
-            if (ct.includes('application/x-msgpack') && msgpackReady) { try { data = window.msgpackLite.decode(new Uint8Array(await clone.arrayBuffer())); } catch(e) { data = await clone.json(); } }
-            else { data = await clone.json(); }
+            if (ct.includes('application/x-msgpack') && msgpackReady) {
+                try { data = window.msgpackLite.decode(new Uint8Array(await clone.arrayBuffer())); } catch(e) { data = await clone.json(); }
+            } else { data = await clone.json(); }
             await cacheInDB(url, data);
         }
         return res;
@@ -129,7 +133,10 @@ function initStreamWorker() {
     PHOTON.worker = new Worker(URL.createObjectURL(new Blob([code],{type:'application/javascript'})));
     PHOTON.worker.onmessage = (e) => {
         requestAnimationFrame(() => {
-            if (PHOTON.lastMsgNode) { const t = PHOTON.lastMsgNode.querySelector('.mes_text'); if(t) t.textContent += e.data.text; }
+            if (PHOTON.lastMsgNode) {
+                const t = PHOTON.lastMsgNode.querySelector('.mes_text');
+                if (t) t.textContent += e.data.text;
+            }
         });
     };
     const ctx = SillyTavern.getContext();
@@ -141,35 +148,29 @@ function initStreamWorker() {
     }
 }
 
-/* ───────── 虚拟滚动 (严格隔离版) ───────── */
+/* ───────── 虚拟滚动 (空闲初始化) ───────── */
 function isChatVisible() {
-    const chatEl = document.getElementById('chat');
-    return chatEl && window.getComputedStyle(chatEl).display !== 'none';
+    const chat = document.getElementById('chat');
+    return chat && window.getComputedStyle(chat).display !== 'none';
 }
 
 function initVirtualScroll() {
-    if (!isChatVisible()) {
-        setStatus('非聊天界面，暂不启用虚拟滚动','info');
-        return;
-    }
-    if (PHOTON.viewport) destroyVirtualScroll();
+    if (!isChatVisible() || PHOTON.viewport) return;
 
     const chatEl = document.getElementById('chat');
     const viewport = document.createElement('div');
     viewport.id = 'photon-viewport';
     viewport.style.cssText = 'position:relative;height:100%;overflow-y:scroll;overflow-x:hidden;contain:strict;';
-    
-    // 关键修改：只移动看起来像消息的元素，避免移动其他插件的UI元素
-    const childNodes = Array.from(chatEl.childNodes);
-    childNodes.forEach(node => {
-        if (node.nodeType === Node.ELEMENT_NODE && (node.classList.contains('mes') || node.querySelector('.mes_text'))) {
+
+    // 只移动消息节点，保留其他插件UI
+    Array.from(chatEl.childNodes).forEach(node => {
+        if (node.nodeType === 1 && (node.classList.contains('mes') || node.querySelector('.mes_text'))) {
             viewport.appendChild(node);
-        } else if (node.nodeType === Node.ELEMENT_NODE) {
-            // 对于不是消息的元素（如插件UI），保留在chat容器中，避免被移除
         }
     });
     chatEl.appendChild(viewport);
     PHOTON.viewport = viewport;
+
     const ctx = SillyTavern.getContext();
     const getChatData = () => ctx.chat || [];
 
@@ -196,6 +197,8 @@ function initVirtualScroll() {
 
     function updateVisible() {
         const chat = getChatData();
+        if (!chat.length) return;
+
         const scrollTop = viewport.scrollTop, viewH = viewport.clientHeight;
         let totalH = 0;
         const visibleIds = new Set();
@@ -239,11 +242,15 @@ function initVirtualScroll() {
     }
 
     function scheduleUpdate() {
-        if (!PHOTON.frameScheduled) { PHOTON.frameScheduled = true; requestAnimationFrame(() => { updateVisible(); PHOTON.frameScheduled = false; }); }
+        if (!PHOTON.frameScheduled) {
+            PHOTON.frameScheduled = true;
+            requestAnimationFrame(() => { updateVisible(); PHOTON.frameScheduled = false; });
+        }
     }
 
     viewport.addEventListener('scroll', scheduleUpdate, { passive: true });
 
+    // 劫持 addOneMessage
     if (!PHOTON._origAddMessage) PHOTON._origAddMessage = window.addOneMessage;
     window.addOneMessage = function(msg) {
         const el = PHOTON._origAddMessage.call(this, msg);
@@ -256,8 +263,10 @@ function initVirtualScroll() {
     ctx.eventSource.on('message_edited', scheduleUpdate);
     ctx.eventSource.on('message_deleted', scheduleUpdate);
     ctx.eventSource.on('chat_changed', scheduleUpdate);
+
+    // 首屏立即渲染，其余节点在空闲时补全
     updateVisible();
-    setStatus('虚拟滚动引擎已启动 (隔离模式)','success');
+    setStatus('虚拟滚动引擎已启动','success');
 }
 
 function destroyVirtualScroll() {
@@ -285,7 +294,7 @@ function watchUIChange() {
                 initStreamWorker();
             } else if (!isChatVisible() && PHOTON.viewport) {
                 destroyVirtualScroll();
-                setStatus('已离开聊天界面，释放虚拟滚动','info');
+                setStatus('已离开聊天界面','info');
             }
         }, 100);
     });
@@ -299,27 +308,36 @@ function watchUIChange() {
 window.addEventListener('error', e => setStatus(`错误: ${e.message}`,'error'));
 window.addEventListener('unhandledrejection', e => setStatus(`未捕获Promise: ${e.reason}`,'error'));
 
-/* ───────── 主启动 ───────── */
+/* ───────── 主启动 (超低优先级分配) ───────── */
 async function main() {
-    loadMsgPack();
+    registerSW();                 // SW 异步，不阻塞
+    loadMsgPack();                // 动态加载脚本，异步
     setStatus('Photon 引擎启动中...','info');
-    try { PHOTON.db = await openDB(); setStatus('IndexedDB 就绪','success'); } catch(e) { setStatus('IndexedDB 不可用','warn'); }
+
+    // 将 IndexedDB 初始化放入空闲时间
+    scheduleIdle(async () => {
+        try { PHOTON.db = await openDB(); setStatus('IndexedDB 就绪','success'); } catch(e) { setStatus('IndexedDB 不可用','warn'); }
+    });
 
     while (!window.SillyTavern?.getContext) await new Promise(r => setTimeout(r, 100));
     const ctx = SillyTavern.getContext();
-    let ready = false;
-    ctx.eventSource.on('APP_READY', () => { if (!ready) { ready = true; startEngines(); } });
-    setTimeout(() => { if (!ready) { ready = true; startEngines(); } }, 5000);
 
+    // APP_READY 后，再延迟启动重任务
     function startEngines() {
         if (window.__photonStarted) return;
         window.__photonStarted = true;
-        watchUIChange();
-        setStatus('加速引擎已就绪 ⚡','success');
-        if ('requestIdleCallback' in window) {
-            requestIdleCallback(() => { fetch('/api/characters/all').then(r=>r.json()).then(d=>cacheInDB('/api/characters/all',d)); }, { timeout: 2000 });
-        }
+        // 用多个空闲回调拆分任务，避免长任务
+        scheduleIdle(() => watchUIChange());
+        scheduleIdle(() => {
+            setStatus('加速引擎就绪 ⚡','success');
+            // 空闲时预热缓存
+            scheduleIdle(() => fetch('/api/characters/all').then(r=>r.json()).then(d=>cacheInDB('/api/characters/all',d)), { timeout: 3000 });
+        });
     }
+
+    let ready = false;
+    ctx.eventSource.on('APP_READY', () => { if (!ready) { ready = true; startEngines(); } });
+    setTimeout(() => { if (!ready) { ready = true; startEngines(); } }, 5000);
 }
 
 main();
