@@ -12,7 +12,11 @@
  *   8. 图片预加载 (link rel=preload)
  *   9. 全局错误捕获 + 右下角状态栏
  * 
- * 修正: 事件回收模块增加 this 类型检查，避免 WeakMap 键无效导致崩溃
+ * 修正:
+ *   - CSS 仅作用于虚拟滚动消息节点，保留原始 .mes 样式
+ *   - 虚拟滚动仅在检测到聊天界面时激活，否则完全跳过
+ *   - 事件回收排除全局高频事件，避免干扰其他扩展
+ *   - 页面切换时自动销毁/重建虚拟滚动
  */
 
 const PHOTON = {
@@ -25,9 +29,11 @@ const PHOTON = {
     statusEl: null,
     db: null,
     resizeObserver: null,
+    active: false,        // 是否处于聊天界面
+    _origAddMessage: null,
 };
 
-/* ───────── 状态提示 UI ───────── */
+/* ───────── 状态提示 ───────── */
 function createStatusEl() {
     if (!document.getElementById('photon-status')) {
         const el = document.createElement('div');
@@ -45,107 +51,64 @@ function setStatus(text, type = 'info') {
     console.log(`%c[Photon-Client] ${text}`, `color:${colors[type]}`);
 }
 
-/* ───────── Service Worker 注册 ───────── */
+/* ───────── Service Worker ───────── */
 function registerServiceWorker() {
-    if (!('serviceWorker' in navigator)) {
-        setStatus('Service Worker 不支持，离线缓存关闭', 'warn');
-        return;
-    }
+    if (!('serviceWorker' in navigator)) return;
     navigator.serviceWorker.register('/scripts/extensions/third-party/TurboClient-Photon/sw-photon.js')
-        .then(reg => setStatus('Service Worker 已注册', 'success'))
-        .catch(err => setStatus(`SW 注册失败: ${err.message}`, 'error'));
+        .then(() => setStatus('Service Worker 已注册', 'success'))
+        .catch(e => setStatus(`SW 注册失败: ${e.message}`, 'error'));
 }
 
-/* ───────── IndexedDB (带 TTL) ───────── */
-const DB_NAME = 'PhotonCache';
-const DB_VERSION = 1;
-const CACHE_TTL = 5 * 60 * 1000; // 5 分钟
-
+/* ───────── IndexedDB ───────── */
+const DB_NAME = 'PhotonCache', DB_VERSION = 1, CACHE_TTL = 5*60*1000;
 function openDB() {
     return new Promise((resolve, reject) => {
-        const request = indexedDB.open(DB_NAME, DB_VERSION);
-        request.onupgradeneeded = () => {
-            const db = request.result;
-            if (!db.objectStoreNames.contains('apiCache')) {
-                db.createObjectStore('apiCache', { keyPath: 'url' });
-            }
-        };
-        request.onsuccess = () => resolve(request.result);
-        request.onerror = () => reject(request.error);
+        const r = indexedDB.open(DB_NAME, DB_VERSION);
+        r.onupgradeneeded = () => { const db = r.result; if (!db.objectStoreNames.contains('apiCache')) db.createObjectStore('apiCache', { keyPath: 'url' }); };
+        r.onsuccess = () => resolve(r.result);
+        r.onerror = () => reject(r.error);
     });
 }
 async function cacheInDB(url, data) {
     if (!PHOTON.db) return;
-    try {
-        const tx = PHOTON.db.transaction('apiCache', 'readwrite');
-        tx.objectStore('apiCache').put({ url, data, timestamp: Date.now() });
-        await tx.done;
-    } catch(e) {}
+    try { const tx = PHOTON.db.transaction('apiCache','readwrite'); tx.objectStore('apiCache').put({url, data, timestamp: Date.now()}); await tx.done; } catch(e){}
 }
 async function getFromDB(url) {
     if (!PHOTON.db) return null;
-    try {
-        const tx = PHOTON.db.transaction('apiCache', 'readonly');
-        const result = await tx.objectStore('apiCache').get(url);
-        if (result && (Date.now() - result.timestamp) < CACHE_TTL) {
-            return result.data;
-        }
-        return null;
-    } catch(e) { return null; }
+    try { const tx = PHOTON.db.transaction('apiCache','readonly'); const r = await tx.objectStore('apiCache').get(url); return (r && Date.now()-r.timestamp < CACHE_TTL) ? r.data : null; } catch(e){ return null; }
 }
 
 /* ───────── MessagePack 安全解码 ───────── */
 let msgpackReady = false;
 function loadMsgPack() {
-    if (window.msgpackLite) { msgpackReady = true; setStatus('MsgPack 库就绪', 'success'); return; }
-    const script = document.createElement('script');
-    script.src = 'https://cdn.jsdelivr.net/npm/msgpack-lite@0.1.26/dist/msgpack.min.js';
-    script.onload = () => { msgpackReady = true; setStatus('MsgPack 动态加载成功', 'success'); };
-    script.onerror = () => setStatus('MsgPack 加载失败，使用 JSON', 'warn');
-    document.head.appendChild(script);
+    if (window.msgpackLite) { msgpackReady = true; setStatus('MsgPack 库就绪','success'); return; }
+    const s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/npm/msgpack-lite@0.1.26/dist/msgpack.min.js';
+    s.onload = () => { msgpackReady = true; setStatus('MsgPack 加载成功','success'); };
+    s.onerror = () => setStatus('MsgPack 加载失败，用 JSON','warn');
+    document.head.appendChild(s);
 }
 async function safeDecodeMsgPack(response) {
-    const ct = response.headers.get('Content-Type') || '';
+    const ct = response.headers.get('Content-Type')||'';
     if (!msgpackReady || !ct.includes('application/x-msgpack')) return response.json();
     const clone = response.clone();
-    try {
-        const buf = await clone.arrayBuffer();
-        const data = window.msgpackLite.decode(new Uint8Array(buf));
-        setStatus('MsgPack 解压成功', 'info');
-        return data;
-    } catch(e) {
-        setStatus(`MsgPack 解码失败: ${e.message}，回退 JSON`, 'error');
-        return response.json();
-    }
+    try { const buf = await clone.arrayBuffer(); return window.msgpackLite.decode(new Uint8Array(buf)); }
+    catch(e) { setStatus('MsgPack 解码失败，回退 JSON','error'); return response.json(); }
 }
 
-/* ───────── fetch 劫持 (IDB 缓存 + MsgPack) ───────── */
+/* ───────── fetch 劫持 ───────── */
 const originalFetch = window.fetch;
-window.fetch = function(url, options = {}) {
+window.fetch = function(url, options={}) {
     if (typeof url === 'string' && url.startsWith('/api')) {
         const method = (options.method || 'GET').toUpperCase();
         if (method === 'GET') {
             return getFromDB(url).then(cached => {
-                if (cached) {
-                    setStatus(`IDB 命中: ${url}`, 'info');
-                    return new Response(JSON.stringify(cached), {
-                        status: 200,
-                        headers: { 'Content-Type': 'application/json', 'X-IDB-Cache': 'HIT' }
-                    });
-                }
+                if (cached) { setStatus(`IDB 命中: ${url}`,'info'); return new Response(JSON.stringify(cached), {status:200, headers:{'Content-Type':'application/json','X-IDB-Cache':'HIT'}}); }
                 return performNetworkFetch(url, options);
             });
         } else {
             return performNetworkFetch(url, options).then(res => {
-                if (res.ok) {
-                    const baseKey = url.split('?')[0];
-                    setTimeout(() => {
-                        if (PHOTON.db) {
-                            const tx = PHOTON.db.transaction('apiCache', 'readwrite');
-                            tx.objectStore('apiCache').delete(baseKey);
-                        }
-                    }, 0);
-                }
+                if (res.ok) { const base = url.split('?')[0]; setTimeout(() => { if(PHOTON.db){ const tx=PHOTON.db.transaction('apiCache','readwrite'); tx.objectStore('apiCache').delete(base); } },0); }
                 return res;
             });
         }
@@ -158,15 +121,10 @@ window.fetch = function(url, options = {}) {
         const res = await originalFetch.call(window, url, options);
         if (res.ok) {
             const clone = res.clone();
-            const ct = clone.headers.get('Content-Type') || '';
+            const ct = clone.headers.get('Content-Type')||'';
             let data;
-            if (ct.includes('application/x-msgpack') && msgpackReady) {
-                try {
-                    data = window.msgpackLite.decode(new Uint8Array(await clone.arrayBuffer()));
-                } catch(e) { data = await clone.json(); }
-            } else {
-                data = await clone.json();
-            }
+            if (ct.includes('application/x-msgpack') && msgpackReady) { try { data = window.msgpackLite.decode(new Uint8Array(await clone.arrayBuffer())); } catch(e) { data = await clone.json(); } }
+            else { data = await clone.json(); }
             await cacheInDB(url, data);
         }
         return res;
@@ -175,46 +133,36 @@ window.fetch = function(url, options = {}) {
 
 /* ───────── 流式 Worker ───────── */
 function initStreamWorker() {
-    const code = `
-        let buffer = '';
-        self.onmessage = (e) => {
-            if (e.data.type === 'token') {
-                buffer += e.data.payload;
-                if (buffer.length > 2 || e.data.payload.includes('\\n')) {
-                    self.postMessage({ text: buffer });
-                    buffer = '';
-                }
-            } else if (e.data.type === 'flush') {
-                if (buffer) self.postMessage({ text: buffer });
-                buffer = '';
-            }
-        };
-    `;
-    const blob = new Blob([code], { type: 'application/javascript' });
-    PHOTON.worker = new Worker(URL.createObjectURL(blob));
+    const code = `let buffer='';self.onmessage=(e)=>{if(e.data.type==='token'){buffer+=e.data.payload;if(buffer.length>2||e.data.payload.includes('\\n')){self.postMessage({text:buffer});buffer='';}}else if(e.data.type==='flush'){if(buffer)self.postMessage({text:buffer});buffer='';}};`;
+    PHOTON.worker = new Worker(URL.createObjectURL(new Blob([code],{type:'application/javascript'})));
     PHOTON.worker.onmessage = (e) => {
         requestAnimationFrame(() => {
-            if (PHOTON.lastMsgNode) {
-                const textEl = PHOTON.lastMsgNode.querySelector('.mes_text');
-                if (textEl) textEl.textContent += e.data.text;
-            }
+            if (PHOTON.lastMsgNode) { const t = PHOTON.lastMsgNode.querySelector('.mes_text'); if(t) t.textContent += e.data.text; }
         });
     };
     const ctx = SillyTavern.getContext();
     if (ctx?.streamingProcessor) {
         const origToken = ctx.streamingProcessor.onToken;
-        ctx.streamingProcessor.onToken = (t) => PHOTON.worker.postMessage({ type:'token', payload: t });
-        ctx.streamingProcessor.finish = (function(orig) {
-            return function() { PHOTON.worker.postMessage({ type:'flush' }); orig.call(this); };
-        })(ctx.streamingProcessor.finish);
-        setStatus('流式 Worker 已接管', 'success');
+        ctx.streamingProcessor.onToken = (t) => PHOTON.worker.postMessage({type:'token', payload:t});
+        ctx.streamingProcessor.finish = (function(orig){ return function(){ PHOTON.worker.postMessage({type:'flush'}); orig.call(this); }; })(ctx.streamingProcessor.finish);
+        setStatus('流式 Worker 已接管','success');
     }
 }
 
-/* ───────── 虚拟滚动 (动态高度) ───────── */
-function initVirtualScroll() {
+/* ───────── 虚拟滚动 (仅在聊天界面激活) ───────── */
+function isChatVisible() {
     const chatEl = document.getElementById('chat');
-    if (!chatEl) return setTimeout(initVirtualScroll, 200);
+    return chatEl && window.getComputedStyle(chatEl).display !== 'none';
+}
+
+function initVirtualScroll() {
+    if (!isChatVisible()) {
+        setStatus('非聊天界面，暂不启用虚拟滚动','info');
+        return;
+    }
+    if (PHOTON.viewport) destroyVirtualScroll();
+
+    const chatEl = document.getElementById('chat');
     const viewport = document.createElement('div');
     viewport.id = 'photon-viewport';
     viewport.style.cssText = 'position:relative;height:100%;overflow-y:scroll;overflow-x:hidden;contain:strict;';
@@ -226,35 +174,29 @@ function initVirtualScroll() {
 
     function createVNode(msg, idx) {
         const div = document.createElement('div');
-        div.className = 'mes virtual-mes';
+        div.className = 'virtual-mes';  // 不再使用 mes 类，避免与原始样式冲突
         div.innerHTML = `<div class="mes_text">${msg.mes || ''}</div>`;
-        div.style.position = 'absolute';
-        div.style.width = '100%';
+        div.style.cssText = 'position:absolute;left:0;right:0;padding:8px;box-sizing:border-box;';
         div.dataset.msgIndex = idx;
         return div;
     }
 
     PHOTON.resizeObserver = new ResizeObserver(entries => {
-        let needUpdate = false;
+        let need = false;
         for (const entry of entries) {
-            const node = entry.target;
-            const id = node.dataset.msgId;
+            const id = entry.target.dataset.msgId;
             if (id) {
-                const newHeight = entry.contentBoxSize?.[0]?.blockSize || entry.contentRect.height;
-                if (PHOTON.messageHeights.get(id) !== newHeight) {
-                    PHOTON.messageHeights.set(id, newHeight);
-                    needUpdate = true;
-                }
+                const h = entry.contentBoxSize?.[0]?.blockSize || entry.contentRect.height;
+                if (PHOTON.messageHeights.get(id) !== h) { PHOTON.messageHeights.set(id, h); need = true; }
             }
         }
-        if (needUpdate) scheduleUpdate();
+        if (need) scheduleUpdate();
     });
 
     function updateVisible() {
         const chat = getChatData();
-        const scrollTop = viewport.scrollTop;
-        const viewH = viewport.clientHeight;
-        let totalHeight = 0;
+        const scrollTop = viewport.scrollTop, viewH = viewport.clientHeight;
+        let totalH = 0;
         const visibleIds = new Set();
 
         chat.forEach((msg, i) => {
@@ -271,10 +213,8 @@ function initVirtualScroll() {
         chat.forEach((msg, i) => {
             const id = msg.id || msg._id;
             const h = PHOTON.messageHeights.get(id) || 80;
-            const top = totalHeight;
-            totalHeight += h;
-            const bottom = top + h;
-            if (bottom >= scrollTop - 200 && top <= scrollTop + viewH + 200) {
+            const top = totalH; totalH += h;
+            if ((top + h) >= scrollTop - 200 && top <= scrollTop + viewH + 200) {
                 visibleIds.add(id);
                 const node = PHOTON.vNodes.get(id);
                 if (node) {
@@ -282,143 +222,147 @@ function initVirtualScroll() {
                     node.style.display = '';
                     node.setAttribute('aria-hidden', 'false');
                     const textEl = node.querySelector('.mes_text');
-                    if (textEl && textEl.textContent !== (msg.mes || '')) textEl.textContent = msg.mes || '';
+                    if (textEl && textEl.textContent !== (msg.mes||'')) textEl.textContent = msg.mes||'';
                     if (!node.isConnected) viewport.appendChild(node);
                 }
             }
         });
 
-        PHOTON.vNodes.forEach((node, id) => {
-            if (!visibleIds.has(id)) {
-                node.style.display = 'none';
-                node.setAttribute('aria-hidden', 'true');
-            }
-        });
+        PHOTON.vNodes.forEach((node, id) => { if (!visibleIds.has(id)) { node.style.display = 'none'; node.setAttribute('aria-hidden','true'); } });
 
         const currentIds = new Set(chat.map(m => m.id || m._id));
-        PHOTON.vNodes.forEach((node, id) => {
-            if (!currentIds.has(id)) {
-                node.remove();
-                PHOTON.vNodes.delete(id);
-                PHOTON.messageHeights.delete(id);
-                PHOTON.resizeObserver.unobserve(node);
-            }
-        });
+        PHOTON.vNodes.forEach((node, id) => { if (!currentIds.has(id)) { node.remove(); PHOTON.vNodes.delete(id); PHOTON.messageHeights.delete(id); PHOTON.resizeObserver.unobserve(node); } });
 
-        viewport.style.height = totalHeight + 'px';
-        setStatus(`虚拟滚动: 可见 ${visibleIds.size}/${chat.length}`, 'info');
+        viewport.style.height = totalH + 'px';
+        setStatus(`虚拟滚动: 可见 ${visibleIds.size}/${chat.length}`,'info');
     }
 
     function scheduleUpdate() {
-        if (!PHOTON.frameScheduled) {
-            PHOTON.frameScheduled = true;
-            requestAnimationFrame(() => {
-                updateVisible();
-                PHOTON.frameScheduled = false;
-            });
-        }
+        if (!PHOTON.frameScheduled) { PHOTON.frameScheduled = true; requestAnimationFrame(() => { updateVisible(); PHOTON.frameScheduled = false; }); }
     }
 
     viewport.addEventListener('scroll', scheduleUpdate, { passive: true });
 
+    // 劫持 addOneMessage
+    if (!PHOTON._origAddMessage) PHOTON._origAddMessage = window.addOneMessage;
     window.addOneMessage = function(msg) {
-        const el = (window._originalAddOneMessage || window.addOneMessage).call(this, msg);
+        const el = PHOTON._origAddMessage.call(this, msg);
         scheduleUpdate();
         const chat = getChatData();
-        if (chat.length) {
-            const lastMsg = chat[chat.length-1];
-            PHOTON.lastMsgNode = PHOTON.vNodes.get(lastMsg.id || lastMsg._id);
-        }
+        if (chat.length) PHOTON.lastMsgNode = PHOTON.vNodes.get(chat[chat.length-1].id || chat[chat.length-1]._id);
         return el;
     };
-    if (!window._originalAddOneMessage) window._originalAddOneMessage = window.addOneMessage;
 
     ctx.eventSource.on('message_edited', scheduleUpdate);
     ctx.eventSource.on('message_deleted', scheduleUpdate);
     ctx.eventSource.on('chat_changed', scheduleUpdate);
     updateVisible();
-    setStatus('虚拟滚动引擎 (动态高度) 已启动', 'success');
+    setStatus('虚拟滚动引擎已启动','success');
 }
 
-/* ───────── 事件自动回收 (修正 WeakMap 错误) ───────── */
+function destroyVirtualScroll() {
+    if (PHOTON.resizeObserver) { PHOTON.resizeObserver.disconnect(); PHOTON.resizeObserver = null; }
+    if (PHOTON.viewport) {
+        const chatEl = document.getElementById('chat');
+        if (chatEl) {
+            while (PHOTON.viewport.firstChild) chatEl.appendChild(PHOTON.viewport.firstChild);
+            PHOTON.viewport.remove();
+        }
+        PHOTON.viewport = null;
+    }
+    PHOTON.vNodes.clear();
+    PHOTON.messageHeights.clear();
+    if (PHOTON._origAddMessage) { window.addOneMessage = PHOTON._origAddMessage; }
+}
+
+/* ───────── 事件自动回收 (排除高频事件) ───────── */
 function initEventCleaner() {
     const reg = new WeakMap();
     const origAdd = EventTarget.prototype.addEventListener;
     EventTarget.prototype.addEventListener = function(type, fn, opts) {
-        // 修复：仅当 this 是合法对象时才记录，否则直接调用原方法
         if (this && typeof this === 'object') {
-            if (!reg.has(this)) reg.set(this, []);
-            reg.get(this).push({ type, fn, opts });
+            // 不记录高频或全局事件，避免清理过度
+            if (!['click','mousemove','scroll','resize','keydown','keyup'].includes(type)) {
+                if (!reg.has(this)) reg.set(this, []);
+                reg.get(this).push({ type, fn, opts });
+            }
         }
         return origAdd.call(this, type, fn, opts);
     };
     new MutationObserver(muts => {
         muts.forEach(m => m.removedNodes.forEach(node => {
             if (node instanceof Element && reg.has(node)) {
-                reg.get(node).forEach(l => {
-                    try { node.removeEventListener(l.type, l.fn, l.opts); } catch(e) {}
-                });
+                reg.get(node).forEach(l => { try { node.removeEventListener(l.type, l.fn, l.opts); } catch(e){} });
                 reg.delete(node);
             }
         }));
     }).observe(document.body, { childList: true, subtree: true });
-    setStatus('事件自动回收已激活', 'success');
+    setStatus('事件自动回收已激活','success');
 }
 
-/* ───────── 预取 & 预加载 ───────── */
-function initPrefetchAndLazy() {
+/* ───────── 预取 ───────── */
+function initPrefetch() {
     document.addEventListener('mouseover', ((fn, limit) => {
         let ready = true;
         return (e) => {
             if (ready && e.target.closest('[data-character-id]') && navigator.serviceWorker.controller) {
                 navigator.serviceWorker.controller.postMessage('PREFETCH_CHARACTERS');
-                ready = false;
-                setTimeout(() => ready = true, limit);
+                ready = false; setTimeout(() => ready = true, limit);
             }
         };
     })(undefined, 200));
-    ['/img/logo.png'].forEach(src => {
-        const link = document.createElement('link');
-        link.rel = 'preload'; link.as = 'image'; link.href = src;
-        document.head.appendChild(link);
-    });
-    setStatus('预取与预加载就绪', 'success');
+    setStatus('预取就绪','success');
 }
 
-/* ───────── 全局错误处理 ───────── */
-window.addEventListener('error', e => setStatus(`错误: ${e.message}`, 'error'));
-window.addEventListener('unhandledrejection', e => setStatus(`未捕获Promise: ${e.reason}`, 'error'));
-
-/* ───────── 引擎总启动 ───────── */
-function startAllEngines() {
-    if (window.__photonEnginesStarted) return;
-    window.__photonEnginesStarted = true;
-    initVirtualScroll();
-    initStreamWorker();
-    initEventCleaner();
-    initPrefetchAndLazy();
-    setStatus('全速运行 ⚡', 'success');
-    if ('requestIdleCallback' in window) {
-        requestIdleCallback(() => {
-            fetch('/api/characters/all').then(r => r.json()).then(d => cacheInDB('/api/characters/all', d));
-        }, { timeout: 2000 });
+/* ───────── 界面切换监听 ───────── */
+function watchUIChange() {
+    const ctx = SillyTavern.getContext();
+    ctx.eventSource.on('chat_changed', () => {
+        setTimeout(() => {
+            if (isChatVisible() && !PHOTON.viewport) {
+                initVirtualScroll();
+                initStreamWorker();
+            } else if (!isChatVisible() && PHOTON.viewport) {
+                destroyVirtualScroll();
+                setStatus('已离开聊天界面，释放虚拟滚动','info');
+            }
+        }, 100);
+    });
+    // 初始检测
+    if (isChatVisible()) {
+        initVirtualScroll();
+        initStreamWorker();
     }
 }
 
+/* ───────── 全局错误 ───────── */
+window.addEventListener('error', e => setStatus(`错误: ${e.message}`,'error'));
+window.addEventListener('unhandledrejection', e => setStatus(`未捕获Promise: ${e.reason}`,'error'));
+
+/* ───────── 主启动 ───────── */
 async function main() {
     registerServiceWorker();
     loadMsgPack();
-    setStatus('Photon 引擎启动中...', 'info');
-    try {
-        PHOTON.db = await openDB();
-        setStatus('IndexedDB 就绪', 'success');
-    } catch(e) { setStatus('IndexedDB 不可用，跳过本地缓存', 'warn'); }
+    setStatus('Photon 引擎启动中...','info');
+    try { PHOTON.db = await openDB(); setStatus('IndexedDB 就绪','success'); } catch(e) { setStatus('IndexedDB 不可用','warn'); }
 
     while (!window.SillyTavern?.getContext) await new Promise(r => setTimeout(r, 100));
     const ctx = SillyTavern.getContext();
     let ready = false;
-    ctx.eventSource.on('APP_READY', () => { if (!ready) { ready = true; startAllEngines(); } });
-    setTimeout(() => { if (!ready) { ready = true; startAllEngines(); } }, 5000);
+    ctx.eventSource.on('APP_READY', () => { if (!ready) { ready = true; startEngines(); } });
+    setTimeout(() => { if (!ready) { ready = true; startEngines(); } }, 5000);
+
+    function startEngines() {
+        if (window.__photonStarted) return;
+        window.__photonStarted = true;
+        initEventCleaner();
+        initPrefetch();
+        watchUIChange(); // 根据界面自动启用/停用虚拟滚动
+        setStatus('加速引擎已就绪 ⚡','success');
+        if ('requestIdleCallback' in window) {
+            requestIdleCallback(() => { fetch('/api/characters/all').then(r=>r.json()).then(d=>cacheInDB('/api/characters/all',d)); }, { timeout: 2000 });
+        }
+    }
 }
 
 main();
