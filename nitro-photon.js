@@ -1,23 +1,36 @@
 /**
- * TurboClient-Photon v4.0.2 终极修正版
- * 修复:
- *   - 虚拟滚动动态高度测量 (ResizeObserver)
- *   - IndexedDB 缓存添加 TTL (5分钟过期)
- *   - 其他细节增强
+ * TurboClient-Photon v4.0.3: 终极客户端加速引擎 (健壮启动版)
+ * 
+ * 功能:
+ *   1. Service Worker 离线缓存 + 预取
+ *   2. IndexedDB 本地 API 缓存 (带 TTL)
+ *   3. MessagePack 二进制解码 (自动回退 JSON)
+ *   4. 流式响应 Worker 处理 (主线程无阻塞)
+ *   5. 完全虚拟滚动 (ResizeObserver 动态高度)
+ *   6. 事件监听自动回收 (防止内存泄漏)
+ *   7. 预测预取 (hover 角色时预加载)
+ *   8. 图片预加载 (link rel=preload)
+ *   9. 防抖 / 节流工具
+ *  10. 全局错误捕获 + 右下角状态栏
+ * 
+ * 启动策略:
+ *  - 优先监听 APP_READY 事件
+ *  - 5 秒后若未触发，自动强制启动所有引擎
  */
+
 const PHOTON = {
-    viewport: null,
-    vNodes: new Map(),
+    viewport: null,            // 虚拟滚动容器
+    vNodes: new Map(),         // 消息ID -> DOM节点
     messageHeights: new Map(), // 消息ID -> 实际高度(px)
     frameScheduled: false,
-    worker: null,
-    lastMsgNode: null,
+    worker: null,              // 流式 Worker
+    lastMsgNode: null,         // 最新消息节点 (永远保留在 DOM)
     statusEl: null,
-    db: null,
+    db: null,                  // IndexedDB 实例
     resizeObserver: null,
 };
 
-// ---------- 状态提示 ----------
+/* ───────── 状态提示 UI ───────── */
 function createStatusEl() {
     if (!document.getElementById('photon-status')) {
         const el = document.createElement('div');
@@ -35,10 +48,21 @@ function setStatus(text, type = 'info') {
     console.log(`%c[Photon-Client] ${text}`, `color:${colors[type]}`);
 }
 
-// ---------- IndexedDB 缓存 (增加 TTL) ----------
+/* ───────── Service Worker 注册 ───────── */
+function registerServiceWorker() {
+    if (!('serviceWorker' in navigator)) {
+        setStatus('Service Worker 不支持，离线缓存关闭', 'warn');
+        return;
+    }
+    navigator.serviceWorker.register('/scripts/extensions/third-party/TurboClient-Photon/sw-photon.js')
+        .then(reg => setStatus('Service Worker 已注册', 'success'))
+        .catch(err => setStatus(`SW 注册失败: ${err.message}`, 'error'));
+}
+
+/* ───────── IndexedDB (带 TTL) ───────── */
 const DB_NAME = 'PhotonCache';
 const DB_VERSION = 1;
-const CACHE_TTL = 5 * 60 * 1000; // 5分钟
+const CACHE_TTL = 5 * 60 * 1000; // 5 分钟
 
 function openDB() {
     return new Promise((resolve, reject) => {
@@ -53,7 +77,6 @@ function openDB() {
         request.onerror = () => reject(request.error);
     });
 }
-
 async function cacheInDB(url, data) {
     if (!PHOTON.db) return;
     try {
@@ -62,7 +85,6 @@ async function cacheInDB(url, data) {
         await tx.done;
     } catch(e) {}
 }
-
 async function getFromDB(url) {
     if (!PHOTON.db) return null;
     try {
@@ -71,12 +93,11 @@ async function getFromDB(url) {
         if (result && (Date.now() - result.timestamp) < CACHE_TTL) {
             return result.data;
         }
-        // 过期或不存在返回 null
         return null;
     } catch(e) { return null; }
 }
 
-// ---------- MessagePack 安全解码 ----------
+/* ───────── MessagePack 安全解码 ───────── */
 let msgpackReady = false;
 function loadMsgPack() {
     if (window.msgpackLite) { msgpackReady = true; setStatus('MsgPack 库就绪', 'success'); return; }
@@ -86,7 +107,6 @@ function loadMsgPack() {
     script.onerror = () => setStatus('MsgPack 加载失败，使用 JSON', 'warn');
     document.head.appendChild(script);
 }
-
 async function safeDecodeMsgPack(response) {
     const ct = response.headers.get('Content-Type') || '';
     if (!msgpackReady || !ct.includes('application/x-msgpack')) return response.json();
@@ -102,7 +122,7 @@ async function safeDecodeMsgPack(response) {
     }
 }
 
-// ---------- fetch 劫持 (IDB + TTL) ----------
+/* ───────── fetch 劫持 (IDB 缓存 + MsgPack) ───────── */
 const originalFetch = window.fetch;
 window.fetch = function(url, options = {}) {
     if (typeof url === 'string' && url.startsWith('/api')) {
@@ -119,11 +139,9 @@ window.fetch = function(url, options = {}) {
                 return performNetworkFetch(url, options);
             });
         } else {
-            // 写操作: 网络请求后清除相关IDB缓存
             return performNetworkFetch(url, options).then(res => {
                 if (res.ok) {
                     const baseKey = url.split('?')[0];
-                    // 异步清除可能相关的缓存
                     setTimeout(() => {
                         if (PHOTON.db) {
                             const tx = PHOTON.db.transaction('apiCache', 'readwrite');
@@ -158,7 +176,7 @@ window.fetch = function(url, options = {}) {
     }
 };
 
-// ---------- 流式 Worker ----------
+/* ───────── 流式 Worker ───────── */
 function initStreamWorker() {
     const code = `
         let buffer = '';
@@ -196,7 +214,7 @@ function initStreamWorker() {
     }
 }
 
-// ---------- 虚拟滚动（动态高度）----------
+/* ───────── 虚拟滚动 (动态高度) ───────── */
 function initVirtualScroll() {
     const chatEl = document.getElementById('chat');
     if (!chatEl) return setTimeout(initVirtualScroll, 200);
@@ -219,7 +237,6 @@ function initVirtualScroll() {
         return div;
     }
 
-    // 使用 ResizeObserver 监听节点高度变化
     PHOTON.resizeObserver = new ResizeObserver(entries => {
         let needUpdate = false;
         for (const entry of entries) {
@@ -249,12 +266,8 @@ function initVirtualScroll() {
                 const node = createVNode(msg, i);
                 node.dataset.msgId = id;
                 PHOTON.vNodes.set(id, node);
-                // 观测高度变化
                 PHOTON.resizeObserver.observe(node);
-                // 设置初始高度占位
-                if (!PHOTON.messageHeights.has(id)) {
-                    PHOTON.messageHeights.set(id, 80); // 默认
-                }
+                if (!PHOTON.messageHeights.has(id)) PHOTON.messageHeights.set(id, 80);
             }
         });
 
@@ -271,11 +284,8 @@ function initVirtualScroll() {
                     node.style.top = top + 'px';
                     node.style.display = '';
                     node.setAttribute('aria-hidden', 'false');
-                    // 更新文本
                     const textEl = node.querySelector('.mes_text');
-                    if (textEl && textEl.textContent !== (msg.mes || '')) {
-                        textEl.textContent = msg.mes || '';
-                    }
+                    if (textEl && textEl.textContent !== (msg.mes || '')) textEl.textContent = msg.mes || '';
                     if (!node.isConnected) viewport.appendChild(node);
                 }
             }
@@ -324,7 +334,6 @@ function initVirtualScroll() {
         }
         return el;
     };
-    // 保存原函数以避免递归
     if (!window._originalAddOneMessage) window._originalAddOneMessage = window.addOneMessage;
 
     ctx.eventSource.on('message_edited', scheduleUpdate);
@@ -334,13 +343,13 @@ function initVirtualScroll() {
     setStatus('虚拟滚动引擎 (动态高度) 已启动', 'success');
 }
 
-// ---------- 事件回收 ----------
+/* ───────── 事件自动回收 ───────── */
 function initEventCleaner() {
     const reg = new WeakMap();
     const origAdd = EventTarget.prototype.addEventListener;
     EventTarget.prototype.addEventListener = function(type, fn, opts) {
         if (!reg.has(this)) reg.set(this, []);
-        reg.get(this).push({type, fn, opts});
+        reg.get(this).push({ type, fn, opts });
         return origAdd.call(this, type, fn, opts);
     };
     new MutationObserver(muts => {
@@ -350,11 +359,11 @@ function initEventCleaner() {
                 reg.delete(node);
             }
         }));
-    }).observe(document.body, {childList:true, subtree:true});
+    }).observe(document.body, { childList: true, subtree: true });
     setStatus('事件自动回收已激活', 'success');
 }
 
-// ---------- 预取 ----------
+/* ───────── 预取 & 预加载 ───────── */
 function initPrefetchAndLazy() {
     document.addEventListener('mouseover', ((fn, limit) => {
         let ready = true;
@@ -362,38 +371,53 @@ function initPrefetchAndLazy() {
             if (ready && e.target.closest('[data-character-id]') && navigator.serviceWorker.controller) {
                 navigator.serviceWorker.controller.postMessage('PREFETCH_CHARACTERS');
                 ready = false;
-                setTimeout(() => ready = true, 200);
+                setTimeout(() => ready = true, limit);
             }
         };
-    })());
-    setStatus('预取就绪', 'success');
+    })(undefined, 200));
+    ['/img/logo.png'].forEach(src => {
+        const link = document.createElement('link');
+        link.rel = 'preload'; link.as = 'image'; link.href = src;
+        document.head.appendChild(link);
+    });
+    setStatus('预取与预加载就绪', 'success');
 }
 
-// ---------- 全局错误 ----------
+/* ───────── 全局错误处理 ───────── */
 window.addEventListener('error', e => setStatus(`错误: ${e.message}`, 'error'));
 window.addEventListener('unhandledrejection', e => setStatus(`未捕获Promise: ${e.reason}`, 'error'));
 
+/* ───────── 引擎总启动 ───────── */
+function startAllEngines() {
+    if (window.__photonEnginesStarted) return;
+    window.__photonEnginesStarted = true;
+    initVirtualScroll();
+    initStreamWorker();
+    initEventCleaner();
+    initPrefetchAndLazy();
+    setStatus('全速运行 ⚡', 'success');
+    if ('requestIdleCallback' in window) {
+        requestIdleCallback(() => {
+            fetch('/api/characters/all').then(r => r.json()).then(d => cacheInDB('/api/characters/all', d));
+        }, { timeout: 2000 });
+    }
+}
+
 async function main() {
+    registerServiceWorker();
     loadMsgPack();
     setStatus('Photon 引擎启动中...', 'info');
     try {
         PHOTON.db = await openDB();
         setStatus('IndexedDB 就绪', 'success');
-    } catch(e) { setStatus('IndexedDB 不可用', 'warn'); }
+    } catch(e) { setStatus('IndexedDB 不可用，跳过本地缓存', 'warn'); }
 
     while (!window.SillyTavern?.getContext) await new Promise(r => setTimeout(r, 100));
     const ctx = SillyTavern.getContext();
-    ctx.eventSource.on('APP_READY', () => {
-        initVirtualScroll();
-        initStreamWorker();
-        initEventCleaner();
-        initPrefetchAndLazy();
-        setStatus('全速运行 ⚡', 'success');
-        if ('requestIdleCallback' in window) {
-            requestIdleCallback(() => {
-                fetch('/api/characters/all').then(r => r.json()).then(d => cacheInDB('/api/characters/all', d));
-            }, { timeout: 2000 });
-        }
-    });
+    let ready = false;
+    ctx.eventSource.on('APP_READY', () => { if (!ready) { ready = true; startAllEngines(); } });
+    // 5 秒超时兜底
+    setTimeout(() => { if (!ready) { ready = true; startAllEngines(); } }, 5000);
 }
+
 main();
