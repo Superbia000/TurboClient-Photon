@@ -6,15 +6,14 @@
     animation: none !important;
     transition: none !important;
 }
-/* 虚拟消息绝对定位，彻底避免布局抖动 */
-.virtual-mes {
-    position: absolute;
-    left: 0;
-    right: 0;
+
+/* 仅作用于虚拟滚动消息节点，避免影响其他 UI */
+#photon-viewport .virtual-mes {
+    backface-visibility: hidden;
+    transform: translateZ(0);
     contain: layout style paint;
-    content-visibility: auto;
-    contain-intrinsic-size: 0 80px;
 }
-.virtual-mes[aria-hidden="true"] { display: none; }
+/* 保留原始 .mes 样式不变 */
+
 /* 所有动画禁用 */
 * { animation-duration: 0s !important; transition-duration: 0s !important; }
